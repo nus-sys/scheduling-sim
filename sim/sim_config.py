@@ -7,22 +7,59 @@ import random
 class SimConfig:
     """Object to hold all configuration state of the simulation. Remains constant."""
 
-    def __init__(self, name=None, num_queues=None, num_threads=None, mapping=[], avg_system_load=None,
-                 initial_num_tasks=None, sim_duration=None, locking_enabled=True, ws_enabled=True, parking=True,
-                 ff_enabled=False, pb_enabled=True, record_allocations=False, realloc_record=None, record_steals=False,
-                 buffer_cores=False, ws_self_checks=False, allocation_delay=False, two_choices=False,
-                 delay_range_enabled=False, oracle=False, delay_flagging=False, enqueue_choice=False, random_ws=False,
-                 constant_service_time=False, regular_arrivals=False, load_thread_count=None, ws_sibling_first=True,
-                 enqueue_by_st_sum=False, always_check_realloc=False, ideal_flag_steal=False, delay_range_by_service_time=False,
-                 ideal_reallocation=False, fred_reallocation=False, spin_parking_enabled=False, utilization_range_enabled=False,
-                 allow_naive_idle=False, work_steal_park_enabled=False, bimodal_service_time=False, join_bounded_shortest_queue=False,
-                 record_queue_lens=False):
+    def __init__(
+        self,
+        name=None,
+        num_queues=None,
+        num_threads=None,
+        mapping=[],
+        avg_system_load=None,
+        initial_num_tasks=None,
+        sim_duration=None,
+        locking_enabled=True,
+        ws_enabled=True,
+        parking=True,
+        ff_enabled=False,
+        pb_enabled=True,
+        record_allocations=False,
+        realloc_record=None,
+        record_steals=False,
+        buffer_cores=False,
+        ws_self_checks=False,
+        allocation_delay=False,
+        two_choices=False,
+        delay_range_enabled=False,
+        oracle=False,
+        delay_flagging=False,
+        enqueue_choice=False,
+        random_ws=False,
+        constant_service_time=False,
+        regular_arrivals=False,
+        load_thread_count=None,
+        ws_sibling_first=True,
+        enqueue_by_st_sum=False,
+        always_check_realloc=False,
+        ideal_flag_steal=False,
+        delay_range_by_service_time=False,
+        ideal_reallocation=False,
+        fred_reallocation=False,
+        spin_parking_enabled=False,
+        utilization_range_enabled=False,
+        allow_naive_idle=False,
+        work_steal_park_enabled=False,
+        bimodal_service_time=False,
+        join_bounded_shortest_queue=False,
+        record_queue_lens=False,
+        preempt_enabled=False,
+    ):
         # Basic configuration
         self.name = name
         self.description = ""
         self.num_queues = num_queues
         self.num_threads = num_threads
-        self.mapping = list(mapping) # mapping is a list of queue numbers indexed by thread number
+        self.mapping = list(
+            mapping
+        )  # mapping is a list of queue numbers indexed by thread number
         self.avg_system_load = avg_system_load
         self.num_tasks = initial_num_tasks
         self.sim_duration = sim_duration
@@ -36,7 +73,9 @@ class SimConfig:
         self.progress_bar = pb_enabled
         self.record_allocations = record_allocations
         self.reallocation_record = realloc_record
-        self.reallocation_replay = self.reallocation_record is not None and self.parking_enabled
+        self.reallocation_replay = (
+            self.reallocation_record is not None and self.parking_enabled
+        )
         self.record_steals = record_steals
         self.buffer_cores_enabled = buffer_cores
         self.delay_range_enabled = delay_range_enabled
@@ -63,8 +102,7 @@ class SimConfig:
         self.bimodal_service_time = bimodal_service_time
         self.join_bounded_shortest_queue = join_bounded_shortest_queue
         self.record_queue_lens = record_queue_lens
-
-        # Constants
+        self.preempt_enabled = preempt_enabled  # Constants
         self.AVERAGE_SERVICE_TIME = 1000
         self.WORK_STEAL_CHECK_TIME = 120
         self.WORK_STEAL_TIME = 120
@@ -92,6 +130,8 @@ class SimConfig:
         self.FLAG_OPTIONS = 10
         self.WORK_STEAL_CHOICES = 10
         self.QUEUE_BOUND = 1
+        self.PREEMPTION_TIME = 200
+        self.PREEMPTION_ITVL = 1000
 
         # Set the work steal permutation
         if num_queues is not None:
@@ -123,17 +163,32 @@ class SimConfig:
             return False
 
         # There must be some way for a core to spend time (even with parking the final core must do something)
-        if self.LOCAL_QUEUE_CHECK_TIME == 0 and self.WORK_STEAL_CHECK_TIME == 0 and \
-                (not self.parking_enabled and self.IDLE_PARK_TIME != 0):
-            print("There must be some way for a core to spend time (even with parking the final core must do something)")
+        if (
+            self.LOCAL_QUEUE_CHECK_TIME == 0
+            and self.WORK_STEAL_CHECK_TIME == 0
+            and (not self.parking_enabled and self.IDLE_PARK_TIME != 0)
+        ):
+            print(
+                "There must be some way for a core to spend time (even with parking the final core must do something)"
+            )
             return False
 
         if self.num_queues != len(set(self.mapping)):
             print("Number of queues does not match number in thread/queue mapping.")
             return False
 
-        if sum([self.buffer_cores_enabled, self.delay_range_enabled, self.ideal_reallocation_enabled,
-                self.fred_reallocation, self.utilization_range_enabled]) > 1:
+        if (
+            sum(
+                [
+                    self.buffer_cores_enabled,
+                    self.delay_range_enabled,
+                    self.ideal_reallocation_enabled,
+                    self.fred_reallocation,
+                    self.utilization_range_enabled,
+                ]
+            )
+            > 1
+        ):
             print("Only one allocation policy may be enabled.")
             return False
 
@@ -150,7 +205,9 @@ class SimConfig:
             return False
 
         if self.WORK_STEAL_CHECK_TIME == 0 and self.ws_self_checks:
-            print("Cannot do checks on local queue while work stealing if it doesn't take any time.")
+            print(
+                "Cannot do checks on local queue while work stealing if it doesn't take any time."
+            )
             return False
 
         if self.fred_reallocation and self.num_threads != self.num_queues:
@@ -158,8 +215,10 @@ class SimConfig:
             return False
 
         if self.fred_reallocation and not self.always_check_realloc:
-            print("With Fred reallocations, always check reallocations needs to be on to make sure a core "
-                  "can wake up if all are parked.")
+            print(
+                "With Fred reallocations, always check reallocations needs to be on to make sure a core "
+                "can wake up if all are parked."
+            )
             return False
 
         if self.num_queues % 2 != 0 and self.ws_sibling_first:
@@ -175,10 +234,14 @@ class SimConfig:
             return False
 
         # At least one way to decide when the simulation is over is needed
-        if (self.num_tasks is None and self.sim_duration is None) or \
-                (self.num_tasks is not None and self.num_tasks <= 0) or \
-                (self.sim_duration is not None and self.sim_duration <= 0):
-            print("There must be at least one way to decide when the simulation is over")
+        if (
+            (self.num_tasks is None and self.sim_duration is None)
+            or (self.num_tasks is not None and self.num_tasks <= 0)
+            or (self.sim_duration is not None and self.sim_duration <= 0)
+        ):
+            print(
+                "There must be at least one way to decide when the simulation is over"
+            )
             return False
 
         return True

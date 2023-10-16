@@ -44,7 +44,7 @@ class Task:
         """Return predicted completion time based on time left."""
         return self.state.timer.get_time() + self.time_left
 
-    def process(self, time_increment=1, stop_condition=None):
+    def process(self, time_increment=1, stop_condition=None, preempt_timer=None):
         """Process the task for given time step.
         :param time_increment: Time step.
         :param stop_condition: Additional condition that must be met for the task to complete other than no more time
@@ -56,6 +56,16 @@ class Task:
 
         # Any processing that must be done with the decremented timer but before the time left is checked
         self.process_logic()
+
+        # If preemption enabled, check if the task has been preempted
+        if (
+            self.config.preempt_enabled
+            and preempt_timer is not None
+            and type(self) == Task
+            and self.time_left > 0
+            and self.state.timer.get_time() - self.start_time >= preempt_timer
+        ):
+            self.preempted = True
 
         # If no more time left and stop condition is met, complete the task
         if self.time_left <= 0 and (stop_condition is None or stop_condition()):
@@ -88,24 +98,57 @@ class Task:
 
     def descriptor(self):
         return "Task (arrival {}, service time {}, original queue: {})".format(
-            self.arrival_time, self.service_time, self.original_queue)
+            self.arrival_time, self.service_time, self.original_queue
+        )
 
     def get_stats(self):
-        stats = [self.arrival_time, self.time_in_system(), self.service_time, self.steal_count, self.original_queue,
-                 self.queued_ahead, self.total_queue, self.queue_checks, self.front_task_time, self.requeue_wait_time()]
+        stats = [
+            self.arrival_time,
+            self.time_in_system(),
+            self.service_time,
+            self.steal_count,
+            self.original_queue,
+            self.queued_ahead,
+            self.total_queue,
+            self.queue_checks,
+            self.front_task_time,
+            self.requeue_wait_time(),
+        ]
 
         if self.config.delay_flagging_enabled:
-            stats += [self.flag_steal_count, self.flag_wait_time, self.flag_set_delay, int(self.flagged), self.flagged_time_left]
+            stats += [
+                self.flag_steal_count,
+                self.flag_wait_time,
+                self.flag_set_delay,
+                int(self.flagged),
+                self.flagged_time_left,
+            ]
 
         stats = [str(x) for x in stats]
         return stats
 
     @staticmethod
     def get_stat_headers(config):
-        headers = ["Arrival Time", "Time in System", "Request Service Time", "Steal Count", "Original Queue",
-                   "Queue Length", "Total Queue Length", "Queue Checks", "Time Left of Task Ahead", "Requeue Wait Time"]
+        headers = [
+            "Arrival Time",
+            "Time in System",
+            "Request Service Time",
+            "Steal Count",
+            "Original Queue",
+            "Queue Length",
+            "Total Queue Length",
+            "Queue Checks",
+            "Time Left of Task Ahead",
+            "Requeue Wait Time",
+        ]
         if config.delay_flagging_enabled:
-            headers += ["Flag Steal Count", "Flag Wait Time", "Flag Set Delay", "Flagged", "Flagged Time Left"]
+            headers += [
+                "Flag Steal Count",
+                "Flag Wait Time",
+                "Flag Set Delay",
+                "Flagged",
+                "Flagged Time Left",
+            ]
         return headers
 
     def __str__(self):
@@ -178,9 +221,13 @@ class AbstractWorkStealTask(Task):
             return False
 
         # Can work steal, record a successful check
-        self.state.record_ws_check(self.thread.id, remote, self.check_count, successful=True)
+        self.state.record_ws_check(
+            self.thread.id, remote, self.check_count, successful=True
+        )
 
-        logging.debug("Thread {} work stealing from queue {}".format(self.thread.id, remote.id))
+        logging.debug(
+            "Thread {} work stealing from queue {}".format(self.thread.id, remote.id)
+        )
         return True
 
     def work_steal(self):
@@ -209,7 +256,7 @@ class ReallocationTask(Task):
         self.is_productive = False
         self.thread = thread
 
-    def process(self, time_increment=1):
+    def process(self, time_increment=1, stop_condition=None, preempt_timer=None):
         """Process the task by decrementing time left and performing necessary accounting."""
         if not self.is_zero_duration():
             self.thread.allocation_time += time_increment
@@ -221,43 +268,54 @@ class ReallocationTask(Task):
         self.thread.last_allocation = self.state.timer.get_time()
 
         # If the queue is not currently available, add it
-        if self.config.num_queues > 1 and not(self.thread.queue.id in self.state.available_queues):
+        if self.config.num_queues > 1 and not (
+            self.thread.queue.id in self.state.available_queues
+        ):
             self.state.available_queues.append(self.thread.queue.id)
         self.state.allocating_threads.remove(self.thread.id)
 
     def descriptor(self):
         return "Reallocation Task (arrival {}, duration {})".format(
-            self.arrival_time, self.service_time)
+            self.arrival_time, self.service_time
+        )
 
 
-class WorkSearchSpin(Task): # TODO: Check the preemption for double-counting
+class WorkSearchSpin(Task):  # TODO: Check the preemption for double-counting
     """Task to spin a thread (not idle, but preemptable) if there is nothing else to do."""
 
     def __init__(self, thread, config, state):
-        super().__init__(config.MINIMUM_WORK_SEARCH_TIME, state.timer.get_time(), config, state)
+        super().__init__(
+            config.MINIMUM_WORK_SEARCH_TIME, state.timer.get_time(), config, state
+        )
         self.is_productive = False
         self.thread = thread
         self.preempted = False
 
-    def process(self, time_increment=1):
+    def process(self, time_increment=1, stop_condition=None, preempt_timer=None):
         """Decrement time remaining and preempt task if work becomes available."""
         self.thread.work_steal_wait_time += time_increment
 
         # If there is a flag, preempt
-        if self.config.delay_flagging_enabled and self.thread.work_steal_flag is not None:
+        if (
+            self.config.delay_flagging_enabled
+            and self.thread.work_steal_flag is not None
+        ):
             self.preempted = True
             self.complete = True
 
         # If you are work stealing and there is any work available in the system, preempt
-        elif self.thread.work_search_state == WorkSearchState.WORK_STEAL_CHECK\
-                and any(q.work_available() and q.try_get_lock(self.thread.id, get_lock=False)
-                        for q in self.state.queues):
+        elif self.thread.work_search_state == WorkSearchState.WORK_STEAL_CHECK and any(
+            q.work_available() and q.try_get_lock(self.thread.id, get_lock=False)
+            for q in self.state.queues
+        ):
             self.preempted = True
             self.complete = True
 
         # If checking local queue and work arrives, preempt
-        elif self.thread.work_search_state == WorkSearchState.LOCAL_QUEUE_FIRST_CHECK and \
-                self.thread.queue.work_available():
+        elif (
+            self.thread.work_search_state == WorkSearchState.LOCAL_QUEUE_FIRST_CHECK
+            and self.thread.queue.work_available()
+        ):
             self.preempted = True
             self.complete = True
 
@@ -275,7 +333,8 @@ class WorkSearchSpin(Task): # TODO: Check the preemption for double-counting
 
     def descriptor(self):
         return "Work Search Spin Task (arrival {}, duration {})".format(
-            self.arrival_time, self.service_time)
+            self.arrival_time, self.service_time
+        )
 
 
 class IdleTask(Task):
@@ -292,7 +351,8 @@ class IdleTask(Task):
 
     def descriptor(self):
         return "Idle Queue Task (arrival {}, duration {})".format(
-            self.arrival_time, self.service_time)
+            self.arrival_time, self.service_time
+        )
 
 
 class EnqueuePenaltyTask(Task):
@@ -306,7 +366,7 @@ class EnqueuePenaltyTask(Task):
         self.thread.enqueue_penalty -= 1
         self.from_preemption = preempted
 
-    def process(self, time_increment=1, stop_condition=None):
+    def process(self, time_increment=1, stop_condition=None, preempt_timer=None):
         """Process the task by decrementing time left and performing necessary accounting."""
         if not self.is_zero_duration():
             self.thread.requeue_time += time_increment
@@ -324,7 +384,8 @@ class EnqueuePenaltyTask(Task):
 
     def descriptor(self):
         return "Enqueue Penalty Task (arrival {}, duration {})".format(
-            self.arrival_time, self.service_time)
+            self.arrival_time, self.service_time
+        )
 
 
 class RequeueTask(Task):
@@ -347,10 +408,16 @@ class RequeueTask(Task):
 
     def can_requeue_more_tasks(self):
         """Check to see if more tasks can be requeued."""
-        unclaimed_tasks = self.state.total_queue_occupancy() - len(self.state.currently_non_productive_cores())
-        return unclaimed_tasks > 0 and self.state.threads_available_for_allocation() and self.thread.queue.length() > 0
+        unclaimed_tasks = self.state.total_queue_occupancy() - len(
+            self.state.currently_non_productive_cores()
+        )
+        return (
+            unclaimed_tasks > 0
+            and self.state.threads_available_for_allocation()
+            and self.thread.queue.length() > 0
+        )
 
-    def process(self, time_increment=1, stop_condition=None):
+    def process(self, time_increment=1, stop_condition=None, preempt_timer=None):
         """Process task by decrementing service time and performing other accounting."""
         if not self.is_zero_duration():
             self.thread.requeue_time += time_increment
@@ -366,7 +433,8 @@ class RequeueTask(Task):
 
     def descriptor(self):
         return "Requeue Task (arrival {}, duration {})".format(
-            self.arrival_time, self.service_time)
+            self.arrival_time, self.service_time
+        )
 
 
 class OracleWorkStealTask(AbstractWorkStealTask):
@@ -381,7 +449,9 @@ class OracleWorkStealTask(AbstractWorkStealTask):
         # queue_lens = []
         queue_options = []
         for queue in self.state.queues:
-            if queue.length() > 0 and self.check_can_work_steal(queue, get_lock_if_available=False):
+            if queue.length() > 0 and self.check_can_work_steal(
+                queue, get_lock_if_available=False
+            ):
                 delays.append(queue.current_delay())
                 # queue_lens.append(thread.queue.length())
                 queue_options.append(queue.id)
@@ -394,7 +464,7 @@ class OracleWorkStealTask(AbstractWorkStealTask):
         """Task is complete if work is found or has searched the minimum required time."""
         return self.remote or self.service_time >= self.config.MINIMUM_WORK_SEARCH_TIME
 
-    def process(self, time_increment=1):
+    def process(self, time_increment=1, stop_condition=None, preempt_timer=None):
         """Process task and account for work stealing time."""
         if not self.is_zero_duration():
             self.thread.work_stealing_time += time_increment
@@ -404,7 +474,10 @@ class OracleWorkStealTask(AbstractWorkStealTask):
         """Attempt to find a remote queue."""
         if self.time_left <= 0 and not self.remote:
             self.choose_remote()
-            if not self.remote and self.service_time < self.config.MINIMUM_WORK_SEARCH_TIME:
+            if (
+                not self.remote
+                and self.service_time < self.config.MINIMUM_WORK_SEARCH_TIME
+            ):
                 self.add_time(self.config.WORK_STEAL_CHECK_TIME)
             elif self.remote:
                 self.add_time(self.config.WORK_STEAL_TIME)
@@ -421,14 +494,17 @@ class OracleWorkStealTask(AbstractWorkStealTask):
 
     def descriptor(self):
         return "Oracle Work Stealing Task (arrival {}, thread {})".format(
-            self.arrival_time, self.thread.id)
+            self.arrival_time, self.thread.id
+        )
 
 
 class QueueCheckTask(Task):
     """Task to check the local queue of a thread."""
 
     def __init__(self, thread, config, state, return_to_ws_task=None):
-        super().__init__(config.LOCAL_QUEUE_CHECK_TIME, state.timer.get_time(), config, state)
+        super().__init__(
+            config.LOCAL_QUEUE_CHECK_TIME, state.timer.get_time(), config, state
+        )
         self.thread = thread
         self.locked_out = not self.thread.queue.try_get_lock(self.thread.id)
         self.is_productive = False
@@ -437,8 +513,11 @@ class QueueCheckTask(Task):
         self.start_work_search_spin = False
 
         # If no work stealing and there's nothing to get, start spin
-        if not config.work_stealing_enabled and config.LOCAL_QUEUE_CHECK_TIME == 0 and \
-                not (self.thread.queue.work_available() or self.locked_out):
+        if (
+            not config.work_stealing_enabled
+            and config.LOCAL_QUEUE_CHECK_TIME == 0
+            and not (self.thread.queue.work_available() or self.locked_out)
+        ):
             if not config.allow_naive_idle:
                 self.start_work_search_spin = True
             else:
@@ -451,20 +530,31 @@ class QueueCheckTask(Task):
 
         # Start work search spin if marked to do so
         if self.start_work_search_spin:
-            self.thread.current_task = WorkSearchSpin(self.thread, self.config, self.state)
+            self.thread.current_task = WorkSearchSpin(
+                self.thread, self.config, self.state
+            )
 
         # If locked out, just advance to next state
         elif self.locked_out:
             self.thread.work_search_state.advance()
 
         # If reallocation replay, no work available, and have searched the minimum time, fill the time
-        elif self.config.reallocation_replay and not self.thread.queue.work_available() \
-                and (self.state.timer.get_time() - self.thread.work_search_state.search_start_time) + 1 \
-                < self.config.MINIMUM_WORK_SEARCH_TIME:
+        elif (
+            self.config.reallocation_replay
+            and not self.thread.queue.work_available()
+            and (
+                self.state.timer.get_time()
+                - self.thread.work_search_state.search_start_time
+            )
+            + 1
+            < self.config.MINIMUM_WORK_SEARCH_TIME
+        ):
             if self.config.LOCAL_QUEUE_CHECK_TIME != 0:
                 self.thread.work_search_state.reset(clear_start_time=False)
             else:
-                self.thread.current_task = WorkSearchSpin(self.thread, self.config, self.state)
+                self.thread.current_task = WorkSearchSpin(
+                    self.thread, self.config, self.state
+                )
 
         # If work is available, take it
         elif self.thread.queue.work_available():
@@ -473,7 +563,9 @@ class QueueCheckTask(Task):
             self.thread.work_search_state.reset()
 
             if self.thread.last_allocation is not None:
-                self.state.alloc_to_task_time += (self.state.timer.get_time() - self.thread.last_allocation)
+                self.state.alloc_to_task_time += (
+                    self.state.timer.get_time() - self.thread.last_allocation
+                )
                 self.thread.last_allocation = None
 
         # If no work and marked to return to a work steal task, do so
@@ -486,7 +578,8 @@ class QueueCheckTask(Task):
 
     def descriptor(self):
         return "Local Queue Task (arrival {}, thread {})".format(
-            self.arrival_time, self.thread.id)
+            self.arrival_time, self.thread.id
+        )
 
 
 class WorkStealTask(AbstractWorkStealTask):
@@ -495,9 +588,15 @@ class WorkStealTask(AbstractWorkStealTask):
     def __init__(self, thread, config, state):
         super().__init__(thread, None, config, state)
         self.state.work_steal_tasks += 1
-        self.original_search_index = self.choose_first_queue() if self.config.two_choices else int(random.uniform(0, self.config.num_queues))
+        self.original_search_index = (
+            self.choose_first_queue()
+            if self.config.two_choices
+            else int(random.uniform(0, self.config.num_queues))
+        )
         self.search_index = self.original_search_index
-        self.local_check_timer = self.config.LOCAL_QUEUE_CHECK_TIMER if self.config.ws_self_checks else None
+        self.local_check_timer = (
+            self.config.LOCAL_QUEUE_CHECK_TIMER if self.config.ws_self_checks else None
+        )
         self.to_search = list(self.config.WS_PERMUTATION)
         self.candidate_remote = None
 
@@ -527,7 +626,10 @@ class WorkStealTask(AbstractWorkStealTask):
         if self.is_done():
             return self.state.timer.get_time() + self.time_left
         elif self.config.ws_self_checks:
-            return min(self.state.timer.get_time() + self.time_left, self.state.timer.get_time() + self.local_check_timer)
+            return min(
+                self.state.timer.get_time() + self.time_left,
+                self.state.timer.get_time() + self.local_check_timer,
+            )
         else:
             return self.state.timer.get_time() + self.time_left
 
@@ -535,12 +637,15 @@ class WorkStealTask(AbstractWorkStealTask):
         """Start the task by checking the sibling thread for work."""
         if self.config.random_work_steal_search:
             self.work_search_walk_random()
-        elif self.config.ws_sibling_first and self.thread.queue.id != self.thread.sibling.queue.id:
+        elif (
+            self.config.ws_sibling_first
+            and self.thread.queue.id != self.thread.sibling.queue.id
+        ):
             self.check_sibling()
         else:
             self.work_search_walk()
 
-    def process(self, time_increment=1):
+    def process(self, time_increment=1, stop_condition=None, preempt_timer=None):
         """Process task and update work steal accounting."""
         if not self.is_zero_duration():
             self.thread.work_stealing_time += time_increment
@@ -552,8 +657,13 @@ class WorkStealTask(AbstractWorkStealTask):
 
     def delay_flag_check(self):
         """Check if the thread has a work steal flag it should respond to. If it does, take that task."""
-        if self.config.delay_flagging_enabled and self.thread.work_steal_flag is not None:
-            self.thread.current_task = FlagStealTask(self.thread, return_to_ws_task=self)
+        if (
+            self.config.delay_flagging_enabled
+            and self.thread.work_steal_flag is not None
+        ):
+            self.thread.current_task = FlagStealTask(
+                self.thread, return_to_ws_task=self
+            )
             return True
         return False
 
@@ -561,13 +671,18 @@ class WorkStealTask(AbstractWorkStealTask):
         """Search other queues for work to steal."""
 
         # Do a check of the thread's own queue occasionally
-        if not self.work_found and self.config.ws_self_checks and self.local_check_timer <= 0:
+        if (
+            not self.work_found
+            and self.config.ws_self_checks
+            and self.local_check_timer <= 0
+        ):
             self.local_check_timer = self.config.LOCAL_QUEUE_CHECK_TIMER
-            self.thread.current_task = QueueCheckTask(self.thread, self.config, self.state, return_to_ws_task=self)
+            self.thread.current_task = QueueCheckTask(
+                self.thread, self.config, self.state, return_to_ws_task=self
+            )
 
         # Try to find work
-        elif not self.work_found and self.time_left <= 0: # Forces sequential checks
-
+        elif not self.work_found and self.time_left <= 0:  # Forces sequential checks
             # Check current candidate
             if self.check_can_work_steal(self.candidate_remote):
                 self.work_found = True
@@ -595,12 +710,19 @@ class WorkStealTask(AbstractWorkStealTask):
             self.thread.successful_ws_time += self.service_time
 
         # If not enough time has been spent looking for work, start the process over again
-        elif (self.state.timer.get_time() - self.thread.work_search_state.search_start_time) + 1 < self.config.MINIMUM_WORK_SEARCH_TIME:
+        elif (
+            self.state.timer.get_time()
+            - self.thread.work_search_state.search_start_time
+        ) + 1 < self.config.MINIMUM_WORK_SEARCH_TIME:
             self.thread.work_search_state.reset(clear_start_time=False)
             self.thread.unsuccessful_ws_time += self.service_time
 
             # Need some way to spend time if checking for work has no overhead <- should this even be a possible config?
-            if self.config.WORK_STEAL_TIME == 0 and self.config.WORK_STEAL_CHECK_TIME == 0 and self.config.LOCAL_QUEUE_CHECK_TIME == 0:
+            if (
+                self.config.WORK_STEAL_TIME == 0
+                and self.config.WORK_STEAL_CHECK_TIME == 0
+                and self.config.LOCAL_QUEUE_CHECK_TIME == 0
+            ):
                 self.thread.current_task = WorkSearchSpin(self.thread)
 
         # If no work found and completed minimum search time, proceed to next step
@@ -616,19 +738,29 @@ class WorkStealTask(AbstractWorkStealTask):
         """Randomly select queues to check for work."""
         # Select a random thread to steal from
         if self.config.WORK_STEAL_CHOICES > 1:
-            sample_len = self.config.WORK_STEAL_CHOICES if len(self.to_search) >= self.config.WORK_STEAL_CHOICES else len(self.to_search)
+            sample_len = (
+                self.config.WORK_STEAL_CHOICES
+                if len(self.to_search) >= self.config.WORK_STEAL_CHOICES
+                else len(self.to_search)
+            )
             choices = random.sample(self.to_search, sample_len)
             # Choose the queue with longest queue or oldest task
             choice = choices[0]
             for option in choices:
                 self.to_search.remove(option)
-                if self.state.queues[option].current_delay() > self.state.queues[choice].current_delay() or self.thread.queue.id == choice:
+                if (
+                    self.state.queues[option].current_delay()
+                    > self.state.queues[choice].current_delay()
+                    or self.thread.queue.id == choice
+                ):
                     choice = option
         else:
             choice = random.choice(self.to_search)
             self.to_search.remove(choice)
 
-        if len(self.to_search) == 0 or (len(self.to_search) == 1 and self.to_search[0] == self.thread.queue.id):
+        if len(self.to_search) == 0 or (
+            len(self.to_search) == 1 and self.to_search[0] == self.thread.queue.id
+        ):
             self.checked_all = True
 
         # Use permutation of queues to ensure that allocation policy is not causing clustering in search
@@ -656,8 +788,11 @@ class WorkStealTask(AbstractWorkStealTask):
         remote = self.state.queues[self.config.WS_PERMUTATION[self.search_index]]
 
         # Skip over ones that were already checked
-        if remote.id == self.thread.queue.id or (self.config.ws_sibling_first and self.thread.sibling is not None and
-                                                 remote.id == self.thread.sibling.queue.id):
+        if remote.id == self.thread.queue.id or (
+            self.config.ws_sibling_first
+            and self.thread.sibling is not None
+            and remote.id == self.thread.sibling.queue.id
+        ):
             self.work_search_walk()
 
         # Otherwise, begin to check if you can steal from it
@@ -676,7 +811,8 @@ class WorkStealTask(AbstractWorkStealTask):
     def descriptor(self):
         remote_id = self.remote.id if self.remote is not None else None
         return "Work Stealing Task (arrival {}, thread {}, remote {})".format(
-            self.arrival_time, self.thread.id, remote_id)
+            self.arrival_time, self.thread.id, remote_id
+        )
 
 
 class FlagStealTask(Task):
@@ -697,7 +833,7 @@ class FlagStealTask(Task):
         self.can_respond = self.check_can_flag_steal()
         state.attempted_flag_steals += 1
 
-    def process(self, time_increment=1):
+    def process(self, time_increment=1, stop_condition=None, preempt_timer=None):
         """Process the task by decrementing time left and performing necessary accounting."""
         if not self.is_zero_duration():
             self.thread.flag_task_time += time_increment
@@ -709,9 +845,17 @@ class FlagStealTask(Task):
         # Check if local thread can steal from remote
         if self.can_respond:
             self.flag_steal()
-            logging.debug("Thread {} flag stole from thread {}".format(self.thread.id, self.remote.id))
+            logging.debug(
+                "Thread {} flag stole from thread {}".format(
+                    self.thread.id, self.remote.id
+                )
+            )
         else:
-            logging.debug("Thread {} cannot steal from thread {}".format(self.thread.id, self.remote.id))
+            logging.debug(
+                "Thread {} cannot steal from thread {}".format(
+                    self.thread.id, self.remote.id
+                )
+            )
 
         # Regardless of outcome, mark that the flag has been responded to
         self.mark_flag_response()
@@ -719,15 +863,22 @@ class FlagStealTask(Task):
         # TODO: Make this fit existing models better
         # Immediately assign new task to avoid any flagging before starting new task
         # If the thread was between tasks or work was found in the remote, check own queue
-        if self.thread.work_search_state == WorkSearchState.LOCAL_QUEUE_FIRST_CHECK or self.can_respond:
-            self.thread.current_task = QueueCheckTask(self.thread, self.config, self.state)
+        if (
+            self.thread.work_search_state == WorkSearchState.LOCAL_QUEUE_FIRST_CHECK
+            or self.can_respond
+        ):
+            self.thread.current_task = QueueCheckTask(
+                self.thread, self.config, self.state
+            )
             self.thread.work_search_state.set_start_time()
         # If the thread was work stealing, return to the work steal task it was on (don't repeat beginning of search)
         elif self.thread.work_search_state == WorkSearchState.WORK_STEAL_CHECK:
             self.thread.current_task = self.ws_task
         # If the thread was about to do its final check before parking, return to that
         elif self.thread.work_search_state == WorkSearchState.LOCAL_QUEUE_FINAL_CHECK:
-            self.thread.current_task = QueueCheckTask(self.thread, self.config, self.state)
+            self.thread.current_task = QueueCheckTask(
+                self.thread, self.config, self.state
+            )
 
     def mark_flag_response(self):
         """Remove the flag from the remote and reset associated clocks."""
@@ -738,7 +889,10 @@ class FlagStealTask(Task):
 
     def tasks_to_steal(self):
         """Return the number of tasks to be stolen. Balances the queues of the local and remote."""
-        return math.ceil(((self.remote.length() + self.thread.queue.length())/2) - self.thread.queue.length())
+        return math.ceil(
+            ((self.remote.length() + self.thread.queue.length()) / 2)
+            - self.thread.queue.length()
+        )
 
     def check_can_flag_steal(self):
         """Check that the local thread can steal from the remote."""
@@ -761,14 +915,32 @@ class FlagStealTask(Task):
         for i in range(num_to_steal):
             stolen_tasks.insert(0, self.remote.dequeue())
         for task in stolen_tasks:
-            self.thread.queue.enqueue(task, stolen=True, flag_steal=True, flag_time=self.remote_thread.flag_time,
-                                      threshold_time=self.remote_thread.threshold_time)
+            self.thread.queue.enqueue(
+                task,
+                stolen=True,
+                flag_steal=True,
+                flag_time=self.remote_thread.flag_time,
+                threshold_time=self.remote_thread.threshold_time,
+            )
 
         if self.config.ideal_flag_steal:
             self.thread.queue.sort_by_arrival()
 
-        self.remote_thread.flag_wait_time += (self.state.timer.get_time() - self.remote_thread.flag_time)
+        self.remote_thread.flag_wait_time += (
+            self.state.timer.get_time() - self.remote_thread.flag_time
+        )
 
     def descriptor(self):
         return "Flag Stealing Task (arrival {}, thread {}, remote {})".format(
-            self.arrival_time, self.thread.id, self.remote_thread.id)
+            self.arrival_time, self.thread.id, self.remote_thread.id
+        )
+
+
+class PreemptionTask(Task):
+    """Task to preempt the current running task."""
+
+    def __init__(self, thread, config, state):
+        super().__init__(config.PREEMPTION_TIME, state.timer.get_time(), config, state)
+        self.thread = thread
+        self.is_productive = False
+        self.is_overhead = True
